@@ -665,9 +665,19 @@ PAPER_SEARCH_MCP_ZENODO_ACCESS_TOKEN=
 PAPER_SEARCH_MCP_GOOGLE_SCHOLAR_PROXY_URL=
 PAPER_SEARCH_MCP_IEEE_API_KEY=
 PAPER_SEARCH_MCP_ACM_API_KEY=
+
+# HTTP transport — only used when running the server over HTTP; ignored for stdio.
+# See "Remote (HTTP) deployment" above.
+# MCP_TRANSPORT=stdio           # stdio | streamable-http | sse
+# MCP_HOST=0.0.0.0
+# MCP_PORT=8000
+# MCP_PATH=/mcp                 # /sse when MCP_TRANSPORT=sse
+# MCP_AUTH_TOKEN=               # optional bearer token; empty = open endpoint
 ```
 
 To use a custom path: `export PAPER_SEARCH_MCP_ENV_FILE=/absolute/path/to/.env`
+
+The `MCP_*` transport variables are read through the same loader, so you can set them in the `.env` file (shown above, commented out by default) instead of exporting them in your shell. The `PAPER_SEARCH_MCP_`-prefixed forms (e.g. `PAPER_SEARCH_MCP_MCP_AUTH_TOKEN`) are also accepted and take precedence. Values exported in the real environment override values in the `.env` file.
 
 > Legacy variable names without the `PAPER_SEARCH_MCP_` prefix (e.g. `CORE_API_KEY`, `UNPAYWALL_EMAIL`) are still supported for backward compatibility.
 

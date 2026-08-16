@@ -15,14 +15,16 @@ skipped automatically when the ``mcp.client.streamable_http`` module is unavaila
 import asyncio
 import os
 import socket
+import tempfile
 import threading
 import time
 import unittest
+from pathlib import Path
 from unittest.mock import patch
 
 import pytest
 
-from paper_search_mcp import server
+from paper_search_mcp import config, server
 
 
 def _free_port() -> int:
@@ -251,6 +253,193 @@ class TestBearerAuthWiring(_TransportSnapshotMixin):
             server.main()
         self.assertIsNone(server.mcp._token_verifier)
         self.assertIsNone(server.mcp.settings.auth)
+
+
+class TestEnvFileLoading(_TransportSnapshotMixin):
+    """Transport and auth vars are picked up from ``~/.config/paper-search-mcp/.env``.
+
+    Confirms the values flow through :func:`paper_search_mcp.config.get_env` (which
+    loads the ``.env`` and honors the ``PAPER_SEARCH_MCP_`` prefix) rather than only
+    from the live process environment. This is what makes ``MCP_AUTH_TOKEN`` work
+    when set solely in the ``.env`` file with no shell export.
+    """
+
+    def _env_patch(self, env_file_path: str):
+        """Return a context that points ``PAPER_SEARCH_MCP_ENV_FILE`` at a custom
+        path and removes any conflicting live ``MCP_*`` vars, so the test is hermetic
+        against the real environment.
+
+        We *delete* the keys rather than setting them to ``""`` because
+        :func:`config._load_env_from_file` uses ``os.environ.setdefault``, which only
+        writes when the key is *absent* — an empty-string value would block the
+        ``.env`` value from landing.
+        """
+        keys_to_clear = [
+            "MCP_TRANSPORT",
+            "MCP_HOST",
+            "MCP_PORT",
+            "MCP_PATH",
+            "MCP_AUTH_TOKEN",
+            "PAPER_SEARCH_MCP_MCP_TRANSPORT",
+            "PAPER_SEARCH_MCP_MCP_HOST",
+            "PAPER_SEARCH_MCP_MCP_PORT",
+            "PAPER_SEARCH_MCP_MCP_PATH",
+            "PAPER_SEARCH_MCP_MCP_AUTH_TOKEN",
+        ]
+        saved = {k: os.environ.pop(k) for k in keys_to_clear if k in os.environ}
+        os.environ["PAPER_SEARCH_MCP_ENV_FILE"] = env_file_path
+
+        class _Restorer:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                os.environ.pop("PAPER_SEARCH_MCP_ENV_FILE", None)
+                for k, v in saved.items():
+                    os.environ[k] = v
+
+        return _Restorer()
+
+    def test_mcp_transport_read_from_env_file(self):
+        with tempfile.NamedTemporaryFile(
+            "w", suffix=".env", delete=False
+        ) as tmp:
+            tmp.write("MCP_TRANSPORT=streamable-http\n")
+            tmp.write("MCP_HOST=10.0.0.1\n")
+            tmp.write("MCP_PORT=7777\n")
+            tmp.write("MCP_PATH=/papers\n")
+            tmp.flush()
+            env_path = tmp.name
+        try:
+            with self._env_patch(env_path):
+                config.load_env_file(force=True)
+                server.main()
+            self.assertEqual(server.mcp.settings.host, "10.0.0.1")
+            self.assertEqual(server.mcp.settings.port, 7777)
+            self.assertEqual(server.mcp.settings.streamable_http_path, "/papers")
+            self.assertEqual(self._calls, [("streamable-http", {})])
+        finally:
+            Path(env_path).unlink(missing_ok=True)
+            config.load_env_file(force=True)
+
+    def test_mcp_auth_token_read_from_env_file_enables_auth(self):
+        with tempfile.NamedTemporaryFile(
+            "w", suffix=".env", delete=False
+        ) as tmp:
+            tmp.write("MCP_TRANSPORT=streamable-http\n")
+            tmp.write("MCP_AUTH_TOKEN=secret-from-dotenv\n")
+            tmp.flush()
+            env_path = tmp.name
+        try:
+            with self._env_patch(env_path):
+                config.load_env_file(force=True)
+                server.main()
+            self.assertIsNotNone(
+                server.mcp._token_verifier,
+                "MCP_AUTH_TOKEN in .env must enable bearer auth",
+            )
+            self.assertIsNotNone(server.mcp.settings.auth)
+            # And the verifier accepts the .env-supplied token.
+            loop = asyncio.new_event_loop()
+            try:
+                ok = loop.run_until_complete(
+                    server.mcp._token_verifier.verify_token("secret-from-dotenv")
+                )
+                bad = loop.run_until_complete(
+                    server.mcp._token_verifier.verify_token("wrong")
+                )
+            finally:
+                loop.close()
+            self.assertIsNotNone(ok)
+            self.assertIsNone(bad)
+        finally:
+            Path(env_path).unlink(missing_ok=True)
+            config.load_env_file(force=True)
+
+    def test_empty_mcp_auth_token_in_env_file_keeps_endpoint_open(self):
+        # An empty value (or absent key) in the .env must NOT enable auth.
+        with tempfile.NamedTemporaryFile(
+            "w", suffix=".env", delete=False
+        ) as tmp:
+            tmp.write("MCP_TRANSPORT=streamable-http\n")
+            tmp.write("MCP_AUTH_TOKEN=\n")
+            tmp.flush()
+            env_path = tmp.name
+        try:
+            with self._env_patch(env_path):
+                config.load_env_file(force=True)
+                server.main()
+            self.assertIsNone(
+                server.mcp._token_verifier,
+                "Empty MCP_AUTH_TOKEN in .env must not enable auth",
+            )
+            self.assertIsNone(server.mcp.settings.auth)
+        finally:
+            Path(env_path).unlink(missing_ok=True)
+            config.load_env_file(force=True)
+
+    def test_prefixed_form_also_works(self):
+        # The config loader checks PAPER_SEARCH_MCP_<NAME> first; confirm that the
+        # prefixed form of the transport vars also drives _apply_http_settings.
+        with tempfile.NamedTemporaryFile(
+            "w", suffix=".env", delete=False
+        ) as tmp:
+            tmp.write("PAPER_SEARCH_MCP_MCP_TRANSPORT=streamable-http\n")
+            tmp.write("PAPER_SEARCH_MCP_MCP_AUTH_TOKEN=prefixed-secret\n")
+            tmp.flush()
+            env_path = tmp.name
+        try:
+            with self._env_patch(env_path):
+                config.load_env_file(force=True)
+                server.main()
+            self.assertEqual(self._calls, [("streamable-http", {})])
+            self.assertIsNotNone(server.mcp._token_verifier)
+            loop = asyncio.new_event_loop()
+            try:
+                ok = loop.run_until_complete(
+                    server.mcp._token_verifier.verify_token("prefixed-secret")
+                )
+            finally:
+                loop.close()
+            self.assertIsNotNone(ok)
+        finally:
+            Path(env_path).unlink(missing_ok=True)
+            config.load_env_file(force=True)
+
+    def test_live_env_overrides_env_file(self):
+        # A value exported in the real environment must win over the .env file
+        # (config.py uses os.environ.setdefault, so explicit env wins).
+        with tempfile.NamedTemporaryFile(
+            "w", suffix=".env", delete=False
+        ) as tmp:
+            tmp.write("MCP_TRANSPORT=streamable-http\n")
+            tmp.write("MCP_PORT=7777\n")
+            tmp.flush()
+            env_path = tmp.name
+        try:
+            with patch.dict(
+                os.environ,
+                {
+                    "PAPER_SEARCH_MCP_ENV_FILE": env_path,
+                    "MCP_TRANSPORT": "sse",  # live value should win
+                    "MCP_PORT": "8888",
+                },
+                clear=False,
+            ):
+                # Clear the prefixed form so it doesn't shadow the live value.
+                for k in (
+                    "PAPER_SEARCH_MCP_MCP_TRANSPORT",
+                    "PAPER_SEARCH_MCP_MCP_PORT",
+                ):
+                    os.environ.pop(k, None)
+                config.load_env_file(force=True)
+                server.main()
+            self.assertEqual(self._calls, [("sse", {})])
+            self.assertEqual(server.mcp.settings.port, 8888)
+            self.assertEqual(server.mcp.settings.sse_path, "/sse")
+        finally:
+            Path(env_path).unlink(missing_ok=True)
+            config.load_env_file(force=True)
 
 
 class TestStaticTokenVerifierContract(unittest.TestCase):

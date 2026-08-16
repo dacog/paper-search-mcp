@@ -1384,24 +1384,35 @@ def _apply_http_settings():
     transports we mutate the existing instance in place instead of rebuilding it. This
     keeps every tool registered on the module-level ``mcp`` intact.
 
+    Values are read via :func:`paper_search_mcp.config.get_env`, which loads
+    ``~/.config/paper-search-mcp/.env`` (or the path in ``PAPER_SEARCH_MCP_ENV_FILE``)
+    and honors the ``PAPER_SEARCH_MCP_`` prefix. Both ``PAPER_SEARCH_MCP_<NAME>`` and
+    the bare ``<NAME>`` are accepted, so any of these work:
+
+    - ``MCP_AUTH_TOKEN=secret`` (export)
+    - ``PAPER_SEARCH_MCP_MCP_AUTH_TOKEN=secret`` (export or .env, prefixed form)
+    - ``MCP_AUTH_TOKEN=secret`` (line in ``~/.config/paper-search-mcp/.env``)
+
     Environment variables:
+      - ``MCP_TRANSPORT`` (default ``stdio``): ``stdio`` | ``streamable-http`` | ``sse``.
       - ``MCP_HOST`` (default ``0.0.0.0``): bind address.
       - ``MCP_PORT`` (default ``8000``): port.
       - ``MCP_PATH`` (default ``/mcp`` for ``streamable-http``, ``/sse`` for ``sse``):
         endpoint path.
-      - ``MCP_AUTH_TOKEN`` (optional): if set, every request to the HTTP endpoint must
-        carry ``Authorization: Bearer <token>``. If unset, the endpoint is open.
+      - ``MCP_AUTH_TOKEN`` (optional): if set to a non-empty value, every request to
+        the HTTP endpoint must carry ``Authorization: Bearer <MCP_AUTH_TOKEN>``. If
+        unset or empty, the endpoint is open. See "Bearer auth" in the README.
     """
-    mcp.settings.host = os.getenv("MCP_HOST", "0.0.0.0")
-    mcp.settings.port = int(os.getenv("MCP_PORT", "8000"))
+    mcp.settings.host = get_env("MCP_HOST", "0.0.0.0") or "0.0.0.0"
+    mcp.settings.port = int(get_env("MCP_PORT", "8000") or "8000")
 
-    transport = os.getenv("MCP_TRANSPORT", "stdio")
+    transport = get_env("MCP_TRANSPORT", "stdio") or "stdio"
     if transport == "streamable-http":
-        mcp.settings.streamable_http_path = os.getenv("MCP_PATH", "/mcp")
+        mcp.settings.streamable_http_path = get_env("MCP_PATH", "/mcp") or "/mcp"
     elif transport == "sse":
-        mcp.settings.sse_path = os.getenv("MCP_PATH", "/sse")
+        mcp.settings.sse_path = get_env("MCP_PATH", "/sse") or "/sse"
 
-    auth_token = os.getenv("MCP_AUTH_TOKEN")
+    auth_token = (get_env("MCP_AUTH_TOKEN", "") or "").strip()
     if auth_token:
         from mcp.server.auth.provider import AccessToken, TokenVerifier
         from mcp.server.auth.settings import AuthSettings
@@ -1426,7 +1437,7 @@ def _apply_http_settings():
 
 
 def main():
-    transport = os.getenv("MCP_TRANSPORT", "stdio")
+    transport = get_env("MCP_TRANSPORT", "stdio") or "stdio"
     if transport == "stdio":
         mcp.run(transport="stdio")
     elif transport == "streamable-http":
