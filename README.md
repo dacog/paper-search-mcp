@@ -256,6 +256,8 @@ The entry point (`main()` in `paper_search_mcp/server.py`) reads transport setti
 | `MCP_PORT` | `8000` | Port for HTTP transports |
 | `MCP_PATH` | `/mcp` | Endpoint path for `streamable-http` (`/sse` is used for SSE) |
 | `MCP_AUTH_TOKEN` | _(empty)_ | Optional bearer token. When set, every HTTP request must carry `Authorization: Bearer <MCP_AUTH_TOKEN>`. Empty = open endpoint. See [Bearer auth](#bearer-auth) below. |
+| `MCP_PDF_DELIVERY` | `embedded` | How `download_*` tools hand a PDF back to a remote client over HTTP: `embedded` (base64 blob in the tool result), `resource` (a `ResourceLink` the client fetches via `resources/read`), or `path` (legacy server-local path string). Ignored under stdio. See [PDF delivery over HTTP](docs/http-pdf-delivery.md). |
+| `MCP_PDF_DELIVERY_EMBEDDED_MAX_BYTES` | `25000000` | Size gate (bytes) for the `embedded` mode. PDFs larger than this fall back to a `ResourceLink`. |
 
 The optional API keys (Unpaywall, CORE, Semantic Scholar, Zenodo, DOAJ, Google Scholar proxy, IEEE, ACM) live on the **server**, in `~/.config/paper-search-mcp/.env` on that host — clients never need to see them.
 
@@ -286,6 +288,16 @@ When `MCP_AUTH_TOKEN` is set on the server, every HTTP request to `/mcp` (or `/s
 When `MCP_AUTH_TOKEN` is empty/unset, the HTTP endpoint is open. For public exposure without auth, put the server behind a reverse proxy (nginx/caddy) that adds TLS and either an `Authorization` header or mTLS, then point your clients at the proxy URL.
 
 > ⚠️ The bearer token is shared between every client you configure. Rotate it by changing `MCP_AUTH_TOKEN` on the server and updating each client's config.
+
+### PDF delivery over HTTP
+
+In stdio mode the `download_*` tools write the PDF to `save_path` on the local filesystem and return the path — both server and client share that filesystem. Over HTTP the client is remote, so a server-local path is useless. The server therefore repackages the downloaded PDF according to `MCP_PDF_DELIVERY`:
+
+- **`embedded`** (default): the tool returns a text summary plus the PDF bytes as a base64 `EmbeddedResource`. Works with any MCP client that renders embedded resources; the LLM only sees the summary, not the blob. PDFs larger than `MCP_PDF_DELIVERY_EMBEDDED_MAX_BYTES` (default 25 MB) automatically fall back to a resource link so a huge paper never blows up the JSON-RPC message.
+- **`resource`**: the tool returns a text summary plus a `ResourceLink` (`paper://{source}/{paper_id}`). The client fetches the bytes on demand via `resources/read`. Keeps tool responses tiny; requires a client that supports `ResourceLink` and binary resource reads.
+- **`path`**: legacy server-local path string. Only useful when the client shares the server's filesystem.
+
+For the size limits, the `paper://{source}/{paper_id}` resource template, and the not-yet-implemented option of serving PDFs over a plain HTTP URL, see [docs/http-pdf-delivery.md](docs/http-pdf-delivery.md).
 
 ### 2. Point a client at it
 

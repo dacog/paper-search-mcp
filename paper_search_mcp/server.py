@@ -1,11 +1,20 @@
 # paper_search_mcp/server.py
-from typing import List, Dict, Optional, Any
+from typing import List, Dict, Optional, Any, Union, Sequence
 import asyncio
+import base64
 import os
 import logging
 import re
 import httpx
 from mcp.server.fastmcp import FastMCP
+from mcp.types import (
+    TextContent,
+    EmbeddedResource,
+    BlobResourceContents,
+    ResourceLink,
+    Annotations,
+)
+from pydantic import AnyUrl
 from .config import get_env
 from .academic_platforms.arxiv import ArxivSearcher
 from .academic_platforms.pubmed import PubMedSearcher
@@ -99,6 +108,255 @@ ALL_SOURCES = [
     "ssrn",
     "unpaywall",
 ]
+
+
+# ---------------------------------------------------------------------------
+# HTTP transport: PDF delivery helpers
+#
+# When the server runs over stdio (the historical default), download_* tools
+# write the PDF to save_path on the *server* filesystem and return the local
+# path as a string. Because the server is a child of the client, both share the
+# same filesystem, so the path is directly usable.
+#
+# When the server runs over streamable-http / sse, the server and client are on
+# different machines: the returned path is meaningless to the client, and the
+# agent cannot reach the server's filesystem. To make downloads usable remotely
+# we offer three delivery modes, selected by MCP_PDF_DELIVERY:
+#
+#   embedded (default): the tool returns [TextContent, EmbeddedResource] where
+#       the EmbeddedResource carries the PDF bytes base64-encoded as a
+#       BlobResourceContents. The client (Claude Desktop, opencode, ...) is
+#       responsible for persisting the blob; the LLM only sees the TextContent
+#       summary, so context window is not flooded.
+#
+#   resource: the tool returns [TextContent, ResourceLink] pointing at
+#       paper://{source}/{paper_id}. The client fetches the bytes on demand via
+#       resources/read. Avoids embedding large blobs in the tool response, but
+#       requires a client that supports ResourceLink + resources/read for binary
+#       resources.
+#
+#   path: legacy behaviour — return the server-local path string. Only useful
+#       when the client happens to share the server filesystem (e.g. the server
+#       runs on the same host as the agent, accessed over HTTP for routing
+#       reasons). PDFs are never sent over the wire in this mode.
+#
+# Size guidance for the "embedded" mode:
+#   - The PDF bytes are base64-encoded (~33% inflation) and carried inside a
+#     JSON-RPC message. The MCP Python SDK + Starlette + uvicorn impose no
+#     fixed body limit, but ASGI servers and reverse proxies do (hypercorn
+#     defaults to 16 MB body; nginx default client_max_body_size is 1 MB;
+#     many MCP clients cap responses at a few MB).
+#   - MCP_PDF_DELIVERY_EMBEDDED_MAX_BYTES (default 25_000_000 ≈ 25 MB raw,
+#     ≈ 33 MB on the wire) gates whether a PDF is embedded. Larger PDFs fall
+#     back to "resource" mode (if available) or "path" with a notice, so a
+#     huge paper never blows up the JSON-RPC response.
+# ---------------------------------------------------------------------------
+
+_PDF_DELIVERY_EMBEDDED = "embedded"
+_PDF_DELIVERY_RESOURCE = "resource"
+_PDF_DELIVERY_PATH = "path"
+_PDF_DELIVERY_VALID = {_PDF_DELIVERY_EMBEDDED, _PDF_DELIVERY_RESOURCE, _PDF_DELIVERY_PATH}
+
+# Conservative default: 25 MB raw PDF → ~33 MB base64 in the JSON-RPC message.
+# Tuned to stay under hypercorn's 16 MB default only when the operator has not
+# raised it; most ASGI stacks (uvicorn) have no default limit and can go higher.
+_DEFAULT_EMBEDDED_MAX_BYTES = 25_000_000
+
+
+def _is_http_transport() -> bool:
+    """True when the server is running over streamable-http or sse.
+
+    Read from MCP_TRANSPORT via get_env() so .env-loaded values are honored.
+    """
+    transport = (get_env("MCP_TRANSPORT", "stdio") or "stdio").strip().lower()
+    return transport in ("streamable-http", "sse")
+
+
+def _pdf_delivery_mode() -> str:
+    """Resolve the configured PDF delivery mode for HTTP transport.
+
+    Always returns ``path`` for stdio (the historical behaviour).
+    For HTTP transports, reads MCP_PDF_DELIVERY (default ``embedded``).
+    """
+    if not _is_http_transport():
+        return _PDF_DELIVERY_PATH
+    mode = (get_env("MCP_PDF_DELIVERY", _PDF_DELIVERY_EMBEDDED) or _PDF_DELIVERY_EMBEDDED).strip().lower()
+    if mode not in _PDF_DELIVERY_VALID:
+        logger.warning("Unknown MCP_PDF_DELIVERY=%r, falling back to 'embedded'", mode)
+        return _PDF_DELIVERY_EMBEDDED
+    return mode
+
+
+def _embedded_max_bytes() -> int:
+    """Parse MCP_PDF_DELIVERY_EMBEDDED_MAX_BYTES as an int (default 25 MB)."""
+    raw = (get_env("MCP_PDF_DELIVERY_EMBEDDED_MAX_BYTES", "") or "").strip()
+    if not raw:
+        return _DEFAULT_EMBEDDED_MAX_BYTES
+    try:
+        value = int(raw)
+        if value <= 0:
+            return _DEFAULT_EMBEDDED_MAX_BYTES
+        return value
+    except ValueError:
+        logger.warning("Invalid MCP_PDF_DELIVERY_EMBEDDED_MAX_BYTES=%r, using default", raw)
+        return _DEFAULT_EMBEDDED_MAX_BYTES
+
+
+def _pdf_uri(source: str, paper_id: str) -> str:
+    """Build a stable paper:// URI for a downloaded PDF."""
+    safe_source = re.sub(r"[^a-zA-Z0-9._-]+", "", source).strip() or "paper"
+    safe_id = re.sub(r"[^a-zA-Z0-9._\-/]+", "_", str(paper_id)).strip("._") or "unknown"
+    return f"paper://{safe_source}/{safe_id}"
+
+
+def _read_pdf_bytes(path: str) -> Optional[bytes]:
+    """Read a downloaded PDF file. Returns None if missing/unreadable."""
+    try:
+        with open(path, "rb") as fh:
+            return fh.read()
+    except (OSError, IOError) as exc:
+        logger.warning("Could not read downloaded PDF at %s: %s", path, exc)
+        return None
+
+
+def _wrap_download_result(
+    result: Any,
+    *,
+    source: str,
+    paper_id: str,
+) -> Union[str, Sequence[Any]]:
+    """Wrap a download_* tool result for the active transport.
+
+    For stdio (or MCP_PDF_DELIVERY=path): return ``result`` unchanged (the
+    server-local path string, or an error message string).
+
+    For HTTP transports with delivery=embedded: if ``result`` is an existing
+    PDF file within the size gate, return
+    ``[TextContent(summary), EmbeddedResource(BlobResourceContents)]``.
+    If the file is too large or missing, fall back to a TextContent notice.
+
+    For HTTP transports with delivery=resource: return
+    ``[TextContent(summary), ResourceLink(uri=paper://...)]`` so the client can
+    fetch the bytes via resources/read on demand.
+    """
+    if not _is_http_transport():
+        return result
+
+    mode = _pdf_delivery_mode()
+    if mode == _PDF_DELIVERY_PATH:
+        return result
+
+    # If the downloader returned an error string (not a path), surface it as
+    # text — there is nothing to embed or link to.
+    if not isinstance(result, str) or not result or not os.path.exists(result):
+        return result
+
+    file_bytes = _read_pdf_bytes(result)
+    if file_bytes is None:
+        return result
+
+    size = len(file_bytes)
+    uri = _pdf_uri(source, paper_id)
+    filename = os.path.basename(result)
+
+    if mode == _PDF_DELIVERY_RESOURCE:
+        return [
+            TextContent(
+                type="text",
+                text=(
+                    f"Downloaded {source}/{paper_id} ({size} bytes) as {filename}. "
+                    f"Fetch the PDF via resources/read with URI {uri}."
+                ),
+            ),
+            ResourceLink(
+                type="resource_link",
+                name=f"{source}_{paper_id}",
+                uri=AnyUrl(uri),
+                description=f"PDF of {source} paper {paper_id}",
+                mimeType="application/pdf",
+                size=size,
+            ),
+        ]
+
+    # embedded (default)
+    max_bytes = _embedded_max_bytes()
+    if size > max_bytes:
+        # Too big to embed safely; fall back to a resource link + a notice so
+        # the client can still fetch it via resources/read if it supports that,
+        # otherwise the agent at least knows the file exists on the server.
+        return [
+            TextContent(
+                type="text",
+                text=(
+                    f"Downloaded {source}/{paper_id} ({size} bytes) as {filename}, "
+                    f"but it exceeds the embedded size gate ({max_bytes} bytes). "
+                    f"The PDF is cached on the server at {result}. "
+                    f"Fetch it via resources/read with URI {uri} if your client "
+                    f"supports binary resources, or raise "
+                    f"MCP_PDF_DELIVERY_EMBEDDED_MAX_BYTES to embed it."
+                ),
+            ),
+            ResourceLink(
+                type="resource_link",
+                name=f"{source}_{paper_id}",
+                uri=AnyUrl(uri),
+                description=f"PDF of {source} paper {paper_id} (oversized, not embedded)",
+                mimeType="application/pdf",
+                size=size,
+            ),
+        ]
+
+    blob_b64 = base64.b64encode(file_bytes).decode("ascii")
+    return [
+        TextContent(
+            type="text",
+            text=(
+                f"Downloaded {source}/{paper_id} ({size} bytes) as {filename}. "
+                f"The PDF is attached as an embedded resource."
+            ),
+        ),
+        EmbeddedResource(
+            type="resource",
+            resource=BlobResourceContents(
+                uri=AnyUrl(uri),
+                blob=blob_b64,
+                mimeType="application/pdf",
+            ),
+            annotations=Annotations(audience=["assistant", "user"], priority=0.5),
+        ),
+    ]
+
+
+# Registered once so paper://{source}/{paper_id} is fetchable via resources/read.
+# Used by the "resource" delivery mode and as an overflow target when a PDF is
+# too large to embed. Returns the cached PDF bytes (base64 by FastMCP).
+def _register_paper_resource() -> None:
+    @mcp.resource("paper://{source}/{paper_id}", mime_type="application/pdf")
+    async def _read_paper_resource(source: str, paper_id: str) -> bytes:
+        # Look for the most likely cached file. We do not keep an index, so we
+        # scan the default downloads dir for a file whose name contains the
+        # (sanitised) paper_id. This is best-effort: if the operator set a
+        # custom save_path the resource may not be found.
+        save_path = "./downloads"
+        safe_id = re.sub(r"[^a-zA-Z0-9._\-/]+", "_", str(paper_id)).strip("._") or "unknown"
+        if not os.path.isdir(save_path):
+            raise FileNotFoundError(f"No downloads directory at {save_path}")
+        candidates = [
+            os.path.join(save_path, f)
+            for f in os.listdir(save_path)
+            if safe_id in f and f.lower().endswith(".pdf")
+        ]
+        if not candidates:
+            raise FileNotFoundError(
+                f"No cached PDF for {source}/{paper_id} under {save_path}. "
+                f"Call download_{source} first."
+            )
+        candidates.sort(key=lambda p: os.path.getmtime(p), reverse=True)
+        with open(candidates[0], "rb") as fh:
+            return fh.read()
+
+
+_register_paper_resource()
 
 
 # ---------------------------------------------------------------------------
@@ -454,20 +712,22 @@ async def search_iacr(
 
 
 @mcp.tool()
-async def download_arxiv(paper_id: str, save_path: str = "./downloads") -> str:
+async def download_arxiv(paper_id: str, save_path: str = "./downloads") -> Any:
     """Download PDF of an arXiv paper.
 
     Args:
         paper_id: arXiv paper ID (e.g., '2106.12345').
         save_path: Directory to save the PDF (default: './downloads').
     Returns:
-        Path to the downloaded PDF file.
+        Path to the downloaded PDF file (stdio) or a content list with the
+        embedded PDF / resource link (HTTP transports).
     """
-    return await asyncio.to_thread(arxiv_searcher.download_pdf, paper_id, save_path)
+    path = await asyncio.to_thread(arxiv_searcher.download_pdf, paper_id, save_path)
+    return _wrap_download_result(path, source="arxiv", paper_id=paper_id)
 
 
 @mcp.tool()
-async def download_pubmed(paper_id: str, save_path: str = "./downloads") -> str:
+async def download_pubmed(paper_id: str, save_path: str = "./downloads") -> Any:
     """Attempt to download PDF of a PubMed paper.
 
     Args:
@@ -477,48 +737,55 @@ async def download_pubmed(paper_id: str, save_path: str = "./downloads") -> str:
         str: Message indicating that direct PDF download is not supported.
     """
     try:
-        return pubmed_searcher.download_pdf(paper_id, save_path)
+        path = pubmed_searcher.download_pdf(paper_id, save_path)
     except NotImplementedError as e:
         return str(e)
+    return _wrap_download_result(path, source="pubmed", paper_id=paper_id)
 
 
 @mcp.tool()
-async def download_biorxiv(paper_id: str, save_path: str = "./downloads") -> str:
+async def download_biorxiv(paper_id: str, save_path: str = "./downloads") -> Any:
     """Download PDF of a bioRxiv paper.
 
     Args:
         paper_id: bioRxiv DOI.
         save_path: Directory to save the PDF (default: './downloads').
     Returns:
-        Path to the downloaded PDF file.
+        Path to the downloaded PDF file (stdio) or a content list with the
+        embedded PDF / resource link (HTTP transports).
     """
-    return biorxiv_searcher.download_pdf(paper_id, save_path)
+    path = biorxiv_searcher.download_pdf(paper_id, save_path)
+    return _wrap_download_result(path, source="biorxiv", paper_id=paper_id)
 
 
 @mcp.tool()
-async def download_medrxiv(paper_id: str, save_path: str = "./downloads") -> str:
+async def download_medrxiv(paper_id: str, save_path: str = "./downloads") -> Any:
     """Download PDF of a medRxiv paper.
 
     Args:
         paper_id: medRxiv DOI.
         save_path: Directory to save the PDF (default: './downloads').
     Returns:
-        Path to the downloaded PDF file.
+        Path to the downloaded PDF file (stdio) or a content list with the
+        embedded PDF / resource link (HTTP transports).
     """
-    return medrxiv_searcher.download_pdf(paper_id, save_path)
+    path = medrxiv_searcher.download_pdf(paper_id, save_path)
+    return _wrap_download_result(path, source="medrxiv", paper_id=paper_id)
 
 
 @mcp.tool()
-async def download_iacr(paper_id: str, save_path: str = "./downloads") -> str:
+async def download_iacr(paper_id: str, save_path: str = "./downloads") -> Any:
     """Download PDF of an IACR ePrint paper.
 
     Args:
         paper_id: IACR paper ID (e.g., '2009/101').
         save_path: Directory to save the PDF (default: './downloads').
     Returns:
-        Path to the downloaded PDF file.
+        Path to the downloaded PDF file (stdio) or a content list with the
+        embedded PDF / resource link (HTTP transports).
     """
-    return iacr_searcher.download_pdf(paper_id, save_path)
+    path = iacr_searcher.download_pdf(paper_id, save_path)
+    return _wrap_download_result(path, source="iacr", paper_id=paper_id)
 
 
 @mcp.tool()
@@ -621,7 +888,7 @@ async def search_semantic(query: str, year: Optional[str] = None, max_results: i
 
 
 @mcp.tool()
-async def download_semantic(paper_id: str, save_path: str = "./downloads") -> str:
+async def download_semantic(paper_id: str, save_path: str = "./downloads") -> Any:
     """Download PDF of a Semantic Scholar paper.    
 
     Args:
@@ -636,9 +903,11 @@ async def download_semantic(paper_id: str, save_path: str = "./downloads") -> st
             - URL:<url> (e.g., "URL:https://arxiv.org/abs/2106.15928v1")
         save_path: Directory to save the PDF (default: './downloads').
     Returns:
-        Path to the downloaded PDF file.
-    """ 
-    return semantic_searcher.download_pdf(paper_id, save_path)
+        Path to the downloaded PDF file (stdio) or a content list with the
+        embedded PDF / resource link (HTTP transports).
+    """
+    path = semantic_searcher.download_pdf(paper_id, save_path)
+    return _wrap_download_result(path, source="semantic", paper_id=paper_id)
 
 
 @mcp.tool()
@@ -712,7 +981,7 @@ async def get_crossref_paper_by_doi(doi: str) -> Dict:
 
 
 @mcp.tool()
-async def download_crossref(paper_id: str, save_path: str = "./downloads") -> str:
+async def download_crossref(paper_id: str, save_path: str = "./downloads") -> Any:
     """Attempt to download PDF of a CrossRef paper.
 
     Args:
@@ -726,9 +995,10 @@ async def download_crossref(paper_id: str, save_path: str = "./downloads") -> st
         Use the DOI to access the paper through the publisher's website.
     """
     try:
-        return crossref_searcher.download_pdf(paper_id, save_path)
+        path = crossref_searcher.download_pdf(paper_id, save_path)
     except NotImplementedError as e:
         return str(e)
+    return _wrap_download_result(path, source="crossref", paper_id=paper_id)
 
 
 @mcp.tool()
@@ -736,7 +1006,7 @@ async def download_scihub(
     identifier: str,
     save_path: str = "./downloads",
     base_url: str = "https://sci-hub.se",
-) -> str:
+) -> Any:
     """Download paper PDF via Sci-Hub (optional fallback connector).
 
     Args:
@@ -749,7 +1019,7 @@ async def download_scihub(
     fetcher = SciHubFetcher(base_url=base_url, output_dir=save_path)
     result = await asyncio.to_thread(fetcher.download_pdf, identifier)
     if result:
-        return result
+        return _wrap_download_result(result, source="scihub", paper_id=identifier)
     return "Sci-Hub download failed. Try DOI first, then title, or change mirror URL."
 
 
@@ -762,7 +1032,7 @@ async def download_with_fallback(
     save_path: str = "./downloads",
     use_scihub: bool = True,
     scihub_base_url: str = "https://sci-hub.se",
-) -> str:
+) -> Any:
     """Try source-native download, OA repositories, Unpaywall, then optional Sci-Hub.
 
     Args:
@@ -797,14 +1067,15 @@ async def download_with_fallback(
         "ssrn": ssrn_searcher.download_pdf,
     }
 
+    result: str = ""
     attempt_errors: List[str] = []
     primary_error = ""
     if source_name in primary_downloaders:
         try:
             primary_result = await asyncio.to_thread(primary_downloaders[source_name], paper_id, save_path)
             if isinstance(primary_result, str) and os.path.exists(primary_result):
-                return primary_result
-            if isinstance(primary_result, str) and primary_result:
+                result = primary_result
+            if isinstance(primary_result, str) and primary_result and not result:
                 primary_error = primary_result
         except Exception as exc:
             primary_error = str(exc)
@@ -815,35 +1086,41 @@ async def download_with_fallback(
     if primary_error:
         attempt_errors.append(f"primary: {primary_error}")
 
-    repository_result, repository_error = await _try_repository_fallback(doi, title, save_path)
-    if repository_result:
-        return repository_result
-    if repository_error:
-        attempt_errors.append(f"repositories: {repository_error}")
+    if not result:
+        repository_result, repository_error = await _try_repository_fallback(doi, title, save_path)
+        if repository_result:
+            result = repository_result
+        elif repository_error:
+            attempt_errors.append(f"repositories: {repository_error}")
 
-    normalized_doi = (doi or "").strip()
-    if normalized_doi:
-        unpaywall_url = await asyncio.to_thread(unpaywall_resolver.resolve_best_pdf_url, normalized_doi)
-        if unpaywall_url:
-            unpaywall_result = await _download_from_url(unpaywall_url, save_path, f"unpaywall_{normalized_doi}")
-            if unpaywall_result:
-                return unpaywall_result
-            attempt_errors.append("unpaywall: resolved OA URL but download failed")
+    if not result:
+        normalized_doi = (doi or "").strip()
+        if normalized_doi:
+            unpaywall_url = await asyncio.to_thread(unpaywall_resolver.resolve_best_pdf_url, normalized_doi)
+            if unpaywall_url:
+                unpaywall_result = await _download_from_url(unpaywall_url, save_path, f"unpaywall_{normalized_doi}")
+                if unpaywall_result:
+                    result = unpaywall_result
+                else:
+                    attempt_errors.append("unpaywall: resolved OA URL but download failed")
+            else:
+                attempt_errors.append("unpaywall: no OA URL found (or PAPER_SEARCH_MCP_UNPAYWALL_EMAIL/UNPAYWALL_EMAIL missing)")
         else:
-            attempt_errors.append("unpaywall: no OA URL found (or PAPER_SEARCH_MCP_UNPAYWALL_EMAIL/UNPAYWALL_EMAIL missing)")
-    else:
-        attempt_errors.append("unpaywall: DOI not provided")
+            attempt_errors.append("unpaywall: DOI not provided")
 
-    if not use_scihub:
-        return "Download failed after OA fallback chain. Details: " + " | ".join(attempt_errors)
+    if not result and not use_scihub:
+        result = "Download failed after OA fallback chain. Details: " + " | ".join(attempt_errors)
 
-    fallback_identifier = (doi or "").strip() or (title or "").strip() or paper_id
-    fetcher = SciHubFetcher(base_url=scihub_base_url, output_dir=save_path)
-    fallback_result = await asyncio.to_thread(fetcher.download_pdf, fallback_identifier)
-    if fallback_result:
-        return fallback_result
+    if not result:
+        fallback_identifier = (doi or "").strip() or (title or "").strip() or paper_id
+        fetcher = SciHubFetcher(base_url=scihub_base_url, output_dir=save_path)
+        fallback_result = await asyncio.to_thread(fetcher.download_pdf, fallback_identifier)
+        if fallback_result:
+            result = fallback_result
+        else:
+            result = "Download failed after OA fallback chain and Sci-Hub fallback. Details: " + " | ".join(attempt_errors)
 
-    return "Download failed after OA fallback chain and Sci-Hub fallback. Details: " + " | ".join(attempt_errors)
+    return _wrap_download_result(result, source=source_name, paper_id=paper_id)
 
 
 @mcp.tool()
@@ -1067,7 +1344,7 @@ async def read_dblp_paper(paper_id: str, save_path: str = "./downloads") -> str:
 
 
 @mcp.tool()
-async def download_dblp(paper_id: str, save_path: str = "./downloads") -> str:
+async def download_dblp(paper_id: str, save_path: str = "./downloads") -> Any:
     """Download PDF for a paper from dblp.
 
     Note: dblp doesn't provide direct PDF access.
@@ -1079,7 +1356,8 @@ async def download_dblp(paper_id: str, save_path: str = "./downloads") -> str:
     Returns:
         str: Message indicating that direct PDF download is not supported.
     """
-    return dblp_searcher.download_pdf(paper_id, save_path)
+    path = dblp_searcher.download_pdf(paper_id, save_path)
+    return _wrap_download_result(path, source="dblp", paper_id=paper_id)
 
 
 @mcp.tool()
@@ -1096,7 +1374,7 @@ async def read_openaire_paper(paper_id: str, save_path: str = "./downloads") -> 
 
 
 @mcp.tool()
-async def download_openaire(paper_id: str, save_path: str = "./downloads") -> str:
+async def download_openaire(paper_id: str, save_path: str = "./downloads") -> Any:
     """Download PDF for a paper from OpenAIRE.
 
     Args:
@@ -1105,7 +1383,8 @@ async def download_openaire(paper_id: str, save_path: str = "./downloads") -> st
     Returns:
         str: Path to downloaded PDF or error message.
     """
-    return openaire_searcher.download_pdf(paper_id, save_path)
+    path = openaire_searcher.download_pdf(paper_id, save_path)
+    return _wrap_download_result(path, source="openaire", paper_id=paper_id)
 
 
 @mcp.tool()
@@ -1122,7 +1401,7 @@ async def read_citeseerx_paper(paper_id: str, save_path: str = "./downloads") ->
 
 
 @mcp.tool()
-async def download_citeseerx(paper_id: str, save_path: str = "./downloads") -> str:
+async def download_citeseerx(paper_id: str, save_path: str = "./downloads") -> Any:
     """Download PDF for a paper from CiteSeerX.
 
     Args:
@@ -1131,7 +1410,8 @@ async def download_citeseerx(paper_id: str, save_path: str = "./downloads") -> s
     Returns:
         str: Path to downloaded PDF or error message.
     """
-    return citeseerx_searcher.download_pdf(paper_id, save_path)
+    path = citeseerx_searcher.download_pdf(paper_id, save_path)
+    return _wrap_download_result(path, source="citeseerx", paper_id=paper_id)
 
 
 @mcp.tool()
@@ -1148,7 +1428,7 @@ async def read_doaj_paper(paper_id: str, save_path: str = "./downloads") -> str:
 
 
 @mcp.tool()
-async def download_doaj(paper_id: str, save_path: str = "./downloads") -> str:
+async def download_doaj(paper_id: str, save_path: str = "./downloads") -> Any:
     """Download PDF for a paper from DOAJ.
 
     Args:
@@ -1157,7 +1437,8 @@ async def download_doaj(paper_id: str, save_path: str = "./downloads") -> str:
     Returns:
         str: Path to downloaded PDF.
     """
-    return doaj_searcher.download_pdf(paper_id, save_path)
+    path = doaj_searcher.download_pdf(paper_id, save_path)
+    return _wrap_download_result(path, source="doaj", paper_id=paper_id)
 
 
 @mcp.tool()
@@ -1174,7 +1455,7 @@ async def read_base_paper(paper_id: str, save_path: str = "./downloads") -> str:
 
 
 @mcp.tool()
-async def download_base(paper_id: str, save_path: str = "./downloads") -> str:
+async def download_base(paper_id: str, save_path: str = "./downloads") -> Any:
     """Download PDF for a paper from BASE.
 
     Args:
@@ -1183,7 +1464,8 @@ async def download_base(paper_id: str, save_path: str = "./downloads") -> str:
     Returns:
         str: Path to downloaded PDF.
     """
-    return base_searcher.download_pdf(paper_id, save_path)
+    path = base_searcher.download_pdf(paper_id, save_path)
+    return _wrap_download_result(path, source="base", paper_id=paper_id)
 
 
 @mcp.tool()
@@ -1200,7 +1482,7 @@ async def read_zenodo_paper(paper_id: str, save_path: str = "./downloads") -> st
 
 
 @mcp.tool()
-async def download_zenodo(paper_id: str, save_path: str = "./downloads") -> str:
+async def download_zenodo(paper_id: str, save_path: str = "./downloads") -> Any:
     """Download PDF for a paper from Zenodo.
 
     Args:
@@ -1209,7 +1491,8 @@ async def download_zenodo(paper_id: str, save_path: str = "./downloads") -> str:
     Returns:
         str: Path to downloaded PDF.
     """
-    return zenodo_searcher.download_pdf(paper_id, save_path)
+    path = zenodo_searcher.download_pdf(paper_id, save_path)
+    return _wrap_download_result(path, source="zenodo", paper_id=paper_id)
 
 
 @mcp.tool()
@@ -1226,7 +1509,7 @@ async def read_hal_paper(paper_id: str, save_path: str = "./downloads") -> str:
 
 
 @mcp.tool()
-async def download_hal(paper_id: str, save_path: str = "./downloads") -> str:
+async def download_hal(paper_id: str, save_path: str = "./downloads") -> Any:
     """Download PDF for a paper from HAL.
 
     Args:
@@ -1235,7 +1518,8 @@ async def download_hal(paper_id: str, save_path: str = "./downloads") -> str:
     Returns:
         str: Path to downloaded PDF.
     """
-    return hal_searcher.download_pdf(paper_id, save_path)
+    path = hal_searcher.download_pdf(paper_id, save_path)
+    return _wrap_download_result(path, source="hal", paper_id=paper_id)
 
 
 @mcp.tool()
@@ -1254,7 +1538,7 @@ async def read_ssrn_paper(paper_id: str, save_path: str = "./downloads") -> str:
 
 
 @mcp.tool()
-async def download_ssrn(paper_id: str, save_path: str = "./downloads") -> str:
+async def download_ssrn(paper_id: str, save_path: str = "./downloads") -> Any:
     """Download PDF for a paper from SSRN.
 
     Note: SSRN connector is metadata-only and download is not supported.
@@ -1265,7 +1549,8 @@ async def download_ssrn(paper_id: str, save_path: str = "./downloads") -> str:
     Returns:
         str: Error message from metadata-only SSRN connector.
     """
-    return ssrn_searcher.download_pdf(paper_id, save_path)
+    path = ssrn_searcher.download_pdf(paper_id, save_path)
+    return _wrap_download_result(path, source="ssrn", paper_id=paper_id)
 
 
 @mcp.tool()
@@ -1282,7 +1567,7 @@ async def read_openalex_paper(paper_id: str, save_path: str = "./downloads") -> 
 
 
 @mcp.tool()
-async def download_openalex(paper_id: str, save_path: str = "./downloads") -> str:
+async def download_openalex(paper_id: str, save_path: str = "./downloads") -> Any:
     """Download PDF for a paper from OpenAlex.
 
     Args:
@@ -1291,7 +1576,8 @@ async def download_openalex(paper_id: str, save_path: str = "./downloads") -> st
     Returns:
         str: Error message, typically OpenAlex relies on extracted pdf_url instead of direct downloads.
     """
-    return await asyncio.to_thread(openalex_searcher.download_pdf, paper_id, save_path)
+    path = await asyncio.to_thread(openalex_searcher.download_pdf, paper_id, save_path)
+    return _wrap_download_result(path, source="openalex", paper_id=paper_id)
 
 
 # ---------------------------------------------------------------------------
@@ -1311,7 +1597,7 @@ if ieee_searcher is not None:
         return await async_search(ieee_searcher, query, max_results)
 
     @mcp.tool()
-    async def download_ieee(paper_id: str, save_path: str = "./downloads") -> str:
+    async def download_ieee(paper_id: str, save_path: str = "./downloads") -> Any:
         """Download a PDF from IEEE Xplore.  Requires PAPER_SEARCH_MCP_IEEE_API_KEY (or IEEE_API_KEY) and institutional access.
 
         Args:
@@ -1320,7 +1606,8 @@ if ieee_searcher is not None:
         Returns:
             str: Path to saved PDF or error message.
         """
-        return await asyncio.to_thread(ieee_searcher.download_pdf, paper_id, save_path)
+        path = await asyncio.to_thread(ieee_searcher.download_pdf, paper_id, save_path)
+        return _wrap_download_result(path, source="ieee", paper_id=paper_id)
 
     @mcp.tool()
     async def read_ieee_paper(paper_id: str, save_path: str = "./downloads") -> str:
@@ -1352,7 +1639,7 @@ if acm_searcher is not None:
         return await async_search(acm_searcher, query, max_results)
 
     @mcp.tool()
-    async def download_acm(paper_id: str, save_path: str = "./downloads") -> str:
+    async def download_acm(paper_id: str, save_path: str = "./downloads") -> Any:
         """Download a PDF from ACM Digital Library.  Requires PAPER_SEARCH_MCP_ACM_API_KEY (or ACM_API_KEY) and institutional access.
 
         Args:
@@ -1361,7 +1648,8 @@ if acm_searcher is not None:
         Returns:
             str: Path to saved PDF or error message.
         """
-        return await asyncio.to_thread(acm_searcher.download_pdf, paper_id, save_path)
+        path = await asyncio.to_thread(acm_searcher.download_pdf, paper_id, save_path)
+        return _wrap_download_result(path, source="acm", paper_id=paper_id)
 
     @mcp.tool()
     async def read_acm_paper(paper_id: str, save_path: str = "./downloads") -> str:
@@ -1402,6 +1690,11 @@ def _apply_http_settings():
       - ``MCP_AUTH_TOKEN`` (optional): if set to a non-empty value, every request to
         the HTTP endpoint must carry ``Authorization: Bearer <MCP_AUTH_TOKEN>``. If
         unset or empty, the endpoint is open. See "Bearer auth" in the README.
+      - ``MCP_PDF_DELIVERY`` (default ``embedded``, HTTP only): how ``download_*``
+        tools return a PDF to a remote client. ``embedded`` | ``resource`` | ``path``.
+        See docs/http-pdf-delivery.md.
+      - ``MCP_PDF_DELIVERY_EMBEDDED_MAX_BYTES`` (default ``25000000``): size gate for
+        the ``embedded`` mode; larger PDFs fall back to a ``ResourceLink``.
     """
     mcp.settings.host = get_env("MCP_HOST", "0.0.0.0") or "0.0.0.0"
     mcp.settings.port = int(get_env("MCP_PORT", "8000") or "8000")

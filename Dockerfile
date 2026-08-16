@@ -35,6 +35,14 @@ ENV MCP_PATH="/mcp"
 # Optional bearer token. When set, every HTTP request must carry
 # `Authorization: Bearer <MCP_AUTH_TOKEN>`. Empty = open endpoint.
 ENV MCP_AUTH_TOKEN=""
+# How download_* tools hand a PDF back to a remote client over HTTP.
+# embedded: base64 blob in the tool result (default).
+# resource: ResourceLink the client fetches via resources/read.
+# path:     legacy server-local path string (client must share FS).
+# Ignored under stdio. See docs/http-pdf-delivery.md.
+ENV MCP_PDF_DELIVERY="embedded"
+# Size gate (bytes) for the embedded mode; larger PDFs fall back to a link.
+ENV MCP_PDF_DELIVERY_EMBEDDED_MAX_BYTES="25000000"
 
 # Document the HTTP port. Only actually listened on when MCP_TRANSPORT is
 # streamable-http or sse; stdio mode does not bind any port.
