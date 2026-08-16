@@ -299,12 +299,15 @@ class TestPaperResourceTemplate(_DeliveryEnvMixin):
         super().setUp()
         self._tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self._tmp.cleanup)
-        # The template reads from ./downloads relative to CWD; we point CWD at
-        # the temp dir so the test is hermetic.
+        # The template's fallback scans ./downloads relative to CWD; we point
+        # CWD at the temp dir so the fallback path is hermetic.
         self._orig_cwd = os.getcwd()
         os.chdir(self._tmp.name)
         os.makedirs("downloads", exist_ok=True)
         self.addCleanup(self._restore_cwd)
+        # Clear the path index so tests don't leak into each other.
+        server._PDF_PATH_INDEX.clear()
+        self.addCleanup(server._PDF_PATH_INDEX.clear)
         self.paper_id = "2106.99999"
         self.pdf_path = os.path.join("downloads", f"{self.paper_id}v1.pdf")
         self.pdf_bytes = b"%PDF-1.4\nresource template test\n%%EOF\n"
@@ -327,6 +330,29 @@ class TestPaperResourceTemplate(_DeliveryEnvMixin):
         # layer converts to BlobResourceContents (base64) on the wire, but
         # read_resource() here yields the raw bytes.
         self.assertEqual(contents[0].content, self.pdf_bytes)
+
+    def test_resource_read_uses_path_index_for_custom_save_path(self):
+        """read_resource finds PDFs saved to arbitrary dirs via the index."""
+        import asyncio
+
+        # Simulate a download to /tmp/whatever (not ./downloads).
+        custom_dir = os.path.join(self._tmp.name, "custom_papers")
+        os.makedirs(custom_dir, exist_ok=True)
+        custom_pdf = os.path.join(custom_dir, "my_paper.pdf")
+        custom_bytes = b"%PDF-1.4\ncustom location\n%%EOF\n"
+        with open(custom_pdf, "wb") as fh:
+            fh.write(custom_bytes)
+
+        # Register the path in the index as _wrap_download_result would.
+        uri = server._pdf_uri("arxiv", "my_custom_id")
+        server._PDF_PATH_INDEX[uri] = os.path.abspath(custom_pdf)
+
+        async def go():
+            return await server.mcp.read_resource("paper://arxiv/my_custom_id")
+
+        contents = asyncio.run(go())
+        self.assertEqual(len(contents), 1)
+        self.assertEqual(contents[0].content, custom_bytes)
 
     def test_resource_read_missing_paper_raises(self):
         import asyncio

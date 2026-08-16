@@ -219,6 +219,12 @@ def _read_pdf_bytes(path: str) -> Optional[bytes]:
         return None
 
 
+# In-memory index: paper:// URI → absolute path of the downloaded PDF.
+# Populated by _wrap_download_result() so read_resource can find PDFs saved
+# to arbitrary save_path directories (not just ./downloads).
+_PDF_PATH_INDEX: Dict[str, str] = {}
+
+
 def _wrap_download_result(
     result: Any,
     *,
@@ -258,6 +264,10 @@ def _wrap_download_result(
     size = len(file_bytes)
     uri = _pdf_uri(source, paper_id)
     filename = os.path.basename(result)
+
+    # Index the absolute path so read_resource can find it regardless of
+    # which save_path the download_* tool was called with.
+    _PDF_PATH_INDEX[uri] = os.path.abspath(result)
 
     if mode == _PDF_DELIVERY_RESOURCE:
         return [
@@ -333,27 +343,34 @@ def _wrap_download_result(
 def _register_paper_resource() -> None:
     @mcp.resource("paper://{source}/{paper_id}", mime_type="application/pdf")
     async def _read_paper_resource(source: str, paper_id: str) -> bytes:
-        # Look for the most likely cached file. We do not keep an index, so we
-        # scan the default downloads dir for a file whose name contains the
-        # (sanitised) paper_id. This is best-effort: if the operator set a
-        # custom save_path the resource may not be found.
+        uri = _pdf_uri(source, paper_id)
+
+        # Fast path: look up the exact path recorded by _wrap_download_result.
+        # This handles downloads to custom save_path directories (e.g. /tmp/...).
+        indexed_path = _PDF_PATH_INDEX.get(uri)
+        if indexed_path and os.path.isfile(indexed_path):
+            with open(indexed_path, "rb") as fh:
+                return fh.read()
+
+        # Fallback: scan ./downloads for a filename containing the paper_id.
+        # Covers PDFs downloaded by stdio clients or before the index existed.
         save_path = "./downloads"
         safe_id = re.sub(r"[^a-zA-Z0-9._\-/]+", "_", str(paper_id)).strip("._") or "unknown"
-        if not os.path.isdir(save_path):
-            raise FileNotFoundError(f"No downloads directory at {save_path}")
-        candidates = [
-            os.path.join(save_path, f)
-            for f in os.listdir(save_path)
-            if safe_id in f and f.lower().endswith(".pdf")
-        ]
-        if not candidates:
-            raise FileNotFoundError(
-                f"No cached PDF for {source}/{paper_id} under {save_path}. "
-                f"Call download_{source} first."
-            )
-        candidates.sort(key=lambda p: os.path.getmtime(p), reverse=True)
-        with open(candidates[0], "rb") as fh:
-            return fh.read()
+        if os.path.isdir(save_path):
+            candidates = [
+                os.path.join(save_path, f)
+                for f in os.listdir(save_path)
+                if safe_id in f and f.lower().endswith(".pdf")
+            ]
+            if candidates:
+                candidates.sort(key=lambda p: os.path.getmtime(p), reverse=True)
+                with open(candidates[0], "rb") as fh:
+                    return fh.read()
+
+        raise FileNotFoundError(
+            f"No cached PDF for {source}/{paper_id}. "
+            f"Call download_{source} first, then read_resource."
+        )
 
 
 _register_paper_resource()
