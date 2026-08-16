@@ -15,6 +15,7 @@ A Model Context Protocol (MCP) server for searching and downloading academic pap
 - [Source Strategy](#source-strategy)
 - [Sci-Hub Notice](#sci-hub-notice)
 - [Installation](#installation)
+  - [Remote (HTTP) deployment](#remote-http-deployment)
   - [Claude Code (Skill)](#claude-code-skill--recommended-for-claude-code-users)
   - [Method 1 — Smithery](#method-1--smithery-one-command-recommended-for-claude-desktop)
   - [Method 2 — uvx](#method-2--uvx-no-install-always-latest)
@@ -233,6 +234,181 @@ The skill uses a CLI (`paper-search`) that wraps the same library as the MCP ser
 > - **macOS**: `~/Library/Application Support/Claude/claude_desktop_config.json`
 > - **Windows**: `%APPDATA%\Claude\claude_desktop_config.json`
 > - **Linux**: `~/.config/Claude/claude_desktop_config.json`
+
+---
+
+## Remote (HTTP) deployment
+
+All stdio methods above run the server as a child process of your MCP client. You can instead run the server once on a remote host (a VPS, a homelab box, a cloud container) and have any MCP-compatible client connect to it over HTTP. This is convenient when:
+
+- you want the server (and its API keys) to live in one place instead of every client's config
+- your client supports `url`-based MCP servers (Claude Desktop, **opencode**, **Hermes**, Smithery-hosted, etc.)
+- you want to share one instance across multiple machines / agents
+
+### 1. Run the server over HTTP
+
+The entry point (`main()` in `paper_search_mcp/server.py`) reads transport settings from environment variables, so you don't need to edit code:
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `MCP_TRANSPORT` | `stdio` | `stdio` \| `streamable-http` \| `sse` |
+| `MCP_HOST` | `0.0.0.0` | Bind address for HTTP transports |
+| `MCP_PORT` | `8000` | Port for HTTP transports |
+| `MCP_PATH` | `/mcp` | Endpoint path for `streamable-http` (`/sse` is used for SSE) |
+
+The optional API keys (Unpaywall, CORE, Semantic Scholar, Zenodo, DOAJ, Google Scholar proxy, IEEE, ACM) live on the **server**, in `~/.config/paper-search-mcp/.env` on that host — clients never need to see them.
+
+Example (on the remote box):
+
+```bash
+# from a clone
+MCP_TRANSPORT=streamable-http MCP_PORT=8000 \
+  uv run -m paper_search_mcp.server
+
+# or after `uv tool install paper-search-mcp`
+MCP_TRANSPORT=streamable-http MCP_PORT=8000 paper-search-mcp
+
+# or Docker (expose port 8000 and override the default CMD)
+docker run --rm -p 8000:8000 \
+  -e MCP_TRANSPORT=streamable-http \
+  -e PAPER_SEARCH_MCP_UNPAYWALL_EMAIL=your@email.com \
+  paper-search-mcp
+```
+
+The endpoint is then `http://<server-ip>:8000/mcp` (or `http://<server-ip>:8000/sse` for SSE transport).
+
+> ⚠️ The MCP SDK's HTTP transport has no built-in auth. For public exposure, put the server behind a reverse proxy (nginx/caddy) that adds TLS and an `Authorization` header (or mTLS), then point your clients at the proxy URL.
+
+### 2. Point a client at it
+
+#### opencode
+
+Add a remote block to your `opencode.json` (or `opencode.jsonc`) — the same shape as any other `type: "remote"` MCP:
+
+```json
+{
+  "$schema": "https://opencode.ai/config.json",
+  "mcp": {
+    "paper-search": {
+      "type": "remote",
+      "enabled": true,
+      "url": "http://<server-ip>:8000/mcp",
+      "headers": {
+        "Authorization": "Bearer {env:PAPER_SEARCH_MCP_TOKEN}"
+      },
+      "autoApprove": [
+        "search_papers",
+        "download_with_fallback",
+        "read_paper",
+        "search_arxiv",
+        "search_pubmed",
+        "search_semantic_scholar",
+        "search_biorxiv",
+        "search_medrxiv",
+        "search_crossref",
+        "search_openalex",
+        "search_dblp",
+        "search_europepmc",
+        "search_pmc",
+        "search_core",
+        "search_openaire",
+        "search_citeseerx",
+        "search_doaj",
+        "search_base",
+        "search_zenodo",
+        "search_hal",
+        "search_ssrn",
+        "search_unpaywall",
+        "search_iacr",
+        "download_arxiv",
+        "download_biorxiv",
+        "download_medrxiv",
+        "download_pmc",
+        "download_europepmc",
+        "download_iacr",
+        "download_zenodo",
+        "download_hal",
+        "download_ssrn",
+        "download_scihub",
+        "read_arxiv_paper",
+        "read_biorxiv_paper",
+        "read_medrxiv_paper",
+        "read_pmc_paper",
+        "read_europepmc_paper",
+        "read_iacr_paper",
+        "read_zenodo_paper",
+        "read_hal_paper",
+        "read_ssrn_paper"
+      ]
+    }
+  }
+}
+```
+
+Drop the `headers` block if your server is on a trusted/private network. The `autoApprove` list skips the per-tool confirmation prompts — trim it to only the tools you want auto-approved. The IEEE/ACM tools (`search_ieee`, `search_acm`, …) only register on the server if the corresponding `PAPER_SEARCH_MCP_IEEE_API_KEY` / `PAPER_SEARCH_MCP_ACM_API_KEY` is set; include them in `autoApprove` only if you've enabled those connectors.
+
+Config file locations:
+- **Global**: `~/.config/opencode/opencode.json` (or `opencode.jsonc`)
+- **Per-project**: `opencode.json` / `opencode.jsonc` in the project root
+
+#### Hermes Agent
+
+Add an HTTP entry to the `mcp_servers` block of `~/.hermes/config.yaml`:
+
+```yaml
+mcp_servers:
+  paper-search:
+    url: "http://<server-ip>:8000/mcp"
+    headers:
+      Authorization: "Bearer ${PAPER_SEARCH_MCP_TOKEN}"
+    # Optional: only expose the tools you actually want Hermes to see
+    tools:
+      include:
+        - search_papers
+        - download_with_fallback
+        - read_paper
+        - search_arxiv
+        - search_pubmed
+        - search_semantic_scholar
+        - search_biorxiv
+        - search_medrxiv
+        - search_crossref
+        - search_openalex
+        - search_dblp
+        - search_europepmc
+        - search_pmc
+        - search_core
+        - search_openaire
+        - search_citeseerx
+        - search_doaj
+        - search_base
+        - search_zenodo
+        - search_hal
+        - search_ssrn
+        - search_unpaywall
+        - search_iacr
+        - download_arxiv
+        - download_biorxiv
+        - download_medrxiv
+        - download_pmc
+        - download_europepmc
+        - download_iacr
+        - download_zenodo
+        - download_hal
+        - download_ssrn
+        - download_scihub
+        - read_arxiv_paper
+        - read_biorxiv_paper
+        - read_medrxiv_paper
+        - read_pmc_paper
+        - read_europepmc_paper
+        - read_iacr_paper
+        - read_zenodo_paper
+        - read_hal_paper
+        - read_ssrn_paper
+```
+
+Hermes registers each MCP tool under the prefix `mcp_<server_name>_<tool_name>`, so e.g. `search_papers` becomes `mcp_paper-search_search_papers` — you usually don't need to call the prefixed name manually, Hermes picks the tool during normal reasoning. Drop the `headers` block if the server is on a private network. The `${VAR}` placeholders are substituted at connect time from your environment (including `~/.hermes/.env`). For mTLS-protected endpoints, use `client_cert: ["~/.certs/mcp-client.crt", "~/.certs/mcp-client.key"]` instead of a bearer header.
 
 ---
 

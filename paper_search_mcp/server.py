@@ -1377,7 +1377,24 @@ if acm_searcher is not None:
 
 
 def main():
-    mcp.run(transport="stdio")
+    transport = os.getenv("MCP_TRANSPORT", "stdio")
+    if transport == "stdio":
+        mcp.run(transport="stdio")
+    elif transport == "streamable-http":
+        mcp.run(
+            transport="streamable-http",
+            host=os.getenv("MCP_HOST", "0.0.0.0"),
+            port=int(os.getenv("MCP_PORT", "8000")),
+            streamable_http_path=os.getenv("MCP_PATH", "/mcp"),
+        )
+    elif transport == "sse":
+        mcp.run(
+            transport="sse",
+            host=os.getenv("MCP_HOST", "0.0.0.0"),
+            port=int(os.getenv("MCP_PORT", "8000")),
+        )
+    else:
+        raise ValueError(f"Unknown transport: {transport}")
 
 
 if __name__ == "__main__":
