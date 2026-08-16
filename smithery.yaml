@@ -1,4 +1,15 @@
 # Smithery configuration file: https://smithery.ai/docs/config#smitheryyaml
+#
+# This file configures the **local stdio install** path (the `npx -y @smithery/cli
+# install @openags/paper-search-mcp` flow). Smithery spawns `paper-search-mcp` as
+# a stdio subprocess, so MCP_TRANSPORT must stay "stdio" here — setting it to
+# streamable-http/sse would break the Smithery local install.
+#
+# To publish the server as a **remote HTTP MCP** on Smithery instead, run it
+# yourself with `MCP_TRANSPORT=streamable-http` (see the "Remote (HTTP)
+# deployment" section of the README) and publish the public HTTPS URL via
+# `smithery mcp publish <url> -n @openags/paper-search-mcp` or at
+# https://smithery.ai/new. That flow does not use this file.
 
 startCommand:
   type: stdio

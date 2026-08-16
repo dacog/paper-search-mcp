@@ -255,6 +255,7 @@ The entry point (`main()` in `paper_search_mcp/server.py`) reads transport setti
 | `MCP_HOST` | `0.0.0.0` | Bind address for HTTP transports |
 | `MCP_PORT` | `8000` | Port for HTTP transports |
 | `MCP_PATH` | `/mcp` | Endpoint path for `streamable-http` (`/sse` is used for SSE) |
+| `MCP_AUTH_TOKEN` | _(empty)_ | Optional bearer token. When set, every HTTP request must carry `Authorization: Bearer <MCP_AUTH_TOKEN>`. Empty = open endpoint. See [Bearer auth](#bearer-auth) below. |
 
 The optional API keys (Unpaywall, CORE, Semantic Scholar, Zenodo, DOAJ, Google Scholar proxy, IEEE, ACM) live on the **server**, in `~/.config/paper-search-mcp/.env` on that host — clients never need to see them.
 
@@ -268,16 +269,23 @@ MCP_TRANSPORT=streamable-http MCP_PORT=8000 \
 # or after `uv tool install paper-search-mcp`
 MCP_TRANSPORT=streamable-http MCP_PORT=8000 paper-search-mcp
 
-# or Docker (expose port 8000 and override the default CMD)
+# or Docker (the image defaults to stdio; set MCP_TRANSPORT to switch to HTTP)
 docker run --rm -p 8000:8000 \
   -e MCP_TRANSPORT=streamable-http \
+  -e MCP_AUTH_TOKEN=your-shared-secret \
   -e PAPER_SEARCH_MCP_UNPAYWALL_EMAIL=your@email.com \
   paper-search-mcp
 ```
 
 The endpoint is then `http://<server-ip>:8000/mcp` (or `http://<server-ip>:8000/sse` for SSE transport).
 
-> ⚠️ The MCP SDK's HTTP transport has no built-in auth. For public exposure, put the server behind a reverse proxy (nginx/caddy) that adds TLS and an `Authorization` header (or mTLS), then point your clients at the proxy URL.
+### Bearer auth
+
+When `MCP_AUTH_TOKEN` is set on the server, every HTTP request to `/mcp` (or `/sse`) must carry `Authorization: Bearer <MCP_AUTH_TOKEN>`. Requests with no token, the wrong token, or a malformed header get `401 Unauthorized`. This is a simple shared-secret gate — fine for personal use, a homelab, or behind a VPN. It is **not** OAuth 2.1; if you need per-user identities, scopes, or token refresh, put the server behind a reverse proxy that handles real OAuth and forward a static bearer to the upstream, or implement a `TokenVerifier` against your IdP.
+
+When `MCP_AUTH_TOKEN` is empty/unset, the HTTP endpoint is open. For public exposure without auth, put the server behind a reverse proxy (nginx/caddy) that adds TLS and either an `Authorization` header or mTLS, then point your clients at the proxy URL.
+
+> ⚠️ The bearer token is shared between every client you configure. Rotate it by changing `MCP_AUTH_TOKEN` on the server and updating each client's config.
 
 ### 2. Point a client at it
 
@@ -294,7 +302,7 @@ Add a remote block to your `opencode.json` (or `opencode.jsonc`) — the same sh
       "enabled": true,
       "url": "http://<server-ip>:8000/mcp",
       "headers": {
-        "Authorization": "Bearer {env:PAPER_SEARCH_MCP_TOKEN}"
+        "Authorization": "Bearer {env:MCP_AUTH_TOKEN}"
       },
       "autoApprove": [
         "search_papers",
@@ -345,7 +353,7 @@ Add a remote block to your `opencode.json` (or `opencode.jsonc`) — the same sh
 }
 ```
 
-Drop the `headers` block if your server is on a trusted/private network. The `autoApprove` list skips the per-tool confirmation prompts — trim it to only the tools you want auto-approved. The IEEE/ACM tools (`search_ieee`, `search_acm`, …) only register on the server if the corresponding `PAPER_SEARCH_MCP_IEEE_API_KEY` / `PAPER_SEARCH_MCP_ACM_API_KEY` is set; include them in `autoApprove` only if you've enabled those connectors.
+The `headers` block is only needed if the server has `MCP_AUTH_TOKEN` set — drop it if your server is on a trusted/private network with no auth. The `autoApprove` list skips the per-tool confirmation prompts — trim it to only the tools you want auto-approved. The IEEE/ACM tools (`search_ieee`, `search_acm`, …) only register on the server if the corresponding `PAPER_SEARCH_MCP_IEEE_API_KEY` / `PAPER_SEARCH_MCP_ACM_API_KEY` is set; include them in `autoApprove` only if you've enabled those connectors.
 
 Config file locations:
 - **Global**: `~/.config/opencode/opencode.json` (or `opencode.jsonc`)
@@ -360,7 +368,7 @@ mcp_servers:
   paper-search:
     url: "http://<server-ip>:8000/mcp"
     headers:
-      Authorization: "Bearer ${PAPER_SEARCH_MCP_TOKEN}"
+      Authorization: "Bearer ${MCP_AUTH_TOKEN}"
     # Optional: only expose the tools you actually want Hermes to see
     tools:
       include:
@@ -408,7 +416,7 @@ mcp_servers:
         - read_ssrn_paper
 ```
 
-Hermes registers each MCP tool under the prefix `mcp_<server_name>_<tool_name>`, so e.g. `search_papers` becomes `mcp_paper-search_search_papers` — you usually don't need to call the prefixed name manually, Hermes picks the tool during normal reasoning. Drop the `headers` block if the server is on a private network. The `${VAR}` placeholders are substituted at connect time from your environment (including `~/.hermes/.env`). For mTLS-protected endpoints, use `client_cert: ["~/.certs/mcp-client.crt", "~/.certs/mcp-client.key"]` instead of a bearer header.
+The `headers` block is only needed if the server has `MCP_AUTH_TOKEN` set — drop it if your server is on a private network. Hermes registers each MCP tool under the prefix `mcp_<server_name>_<tool_name>`, so e.g. `search_papers` becomes `mcp_paper-search_search_papers` — you usually don't need to call the prefixed name manually, Hermes picks the tool during normal reasoning. The `${VAR}` placeholders are substituted at connect time from your environment (including `~/.hermes/.env`). For mTLS-protected endpoints, use `client_cert: ["~/.certs/mcp-client.crt", "~/.certs/mcp-client.key"]` instead of a bearer header.
 
 ---
 

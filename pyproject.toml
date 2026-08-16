@@ -46,6 +46,11 @@ dev = [
     "pytest>=8.0",
 ]
 
+[tool.pytest.ini_options]
+markers = [
+    "live: marks tests that boot a real HTTP server and connect via the MCP client SDK (deselect with '-m \"not live\"')",
+]
+
 [project.urls]
 Homepage = "https://github.com/openags/paper-search-mcp"
 Repository = "https://github.com/openags/paper-search-mcp"

@@ -1376,23 +1376,65 @@ if acm_searcher is not None:
         return acm_searcher.read_paper(paper_id, save_path)
 
 
+def _apply_http_settings():
+    """Apply host/port/path and optional bearer auth to the module-level ``mcp`` instance.
+
+    The installed ``mcp`` SDK reads transport settings from ``mcp.settings`` (populated at
+    ``FastMCP.__init__`` time) rather than from ``mcp.run(...)`` kwargs, so for HTTP
+    transports we mutate the existing instance in place instead of rebuilding it. This
+    keeps every tool registered on the module-level ``mcp`` intact.
+
+    Environment variables:
+      - ``MCP_HOST`` (default ``0.0.0.0``): bind address.
+      - ``MCP_PORT`` (default ``8000``): port.
+      - ``MCP_PATH`` (default ``/mcp`` for ``streamable-http``, ``/sse`` for ``sse``):
+        endpoint path.
+      - ``MCP_AUTH_TOKEN`` (optional): if set, every request to the HTTP endpoint must
+        carry ``Authorization: Bearer <token>``. If unset, the endpoint is open.
+    """
+    mcp.settings.host = os.getenv("MCP_HOST", "0.0.0.0")
+    mcp.settings.port = int(os.getenv("MCP_PORT", "8000"))
+
+    transport = os.getenv("MCP_TRANSPORT", "stdio")
+    if transport == "streamable-http":
+        mcp.settings.streamable_http_path = os.getenv("MCP_PATH", "/mcp")
+    elif transport == "sse":
+        mcp.settings.sse_path = os.getenv("MCP_PATH", "/sse")
+
+    auth_token = os.getenv("MCP_AUTH_TOKEN")
+    if auth_token:
+        from mcp.server.auth.provider import AccessToken, TokenVerifier
+        from mcp.server.auth.settings import AuthSettings
+
+        class _StaticTokenVerifier(TokenVerifier):
+            async def verify_token(self, token: str):
+                if token == auth_token:
+                    return AccessToken(
+                        token=token,
+                        client_id="mcp-client",
+                        scopes=[],
+                    )
+                return None
+
+        base_url = f"http://{mcp.settings.host}:{mcp.settings.port}"
+        mcp._token_verifier = _StaticTokenVerifier()
+        mcp.settings.auth = AuthSettings(
+            issuer_url=base_url,
+            resource_server_url=base_url,
+            required_scopes=[],
+        )
+
+
 def main():
     transport = os.getenv("MCP_TRANSPORT", "stdio")
     if transport == "stdio":
         mcp.run(transport="stdio")
     elif transport == "streamable-http":
-        mcp.run(
-            transport="streamable-http",
-            host=os.getenv("MCP_HOST", "0.0.0.0"),
-            port=int(os.getenv("MCP_PORT", "8000")),
-            streamable_http_path=os.getenv("MCP_PATH", "/mcp"),
-        )
+        _apply_http_settings()
+        mcp.run(transport="streamable-http")
     elif transport == "sse":
-        mcp.run(
-            transport="sse",
-            host=os.getenv("MCP_HOST", "0.0.0.0"),
-            port=int(os.getenv("MCP_PORT", "8000")),
-        )
+        _apply_http_settings()
+        mcp.run(transport="sse")
     else:
         raise ValueError(f"Unknown transport: {transport}")
 

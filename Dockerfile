@@ -25,5 +25,20 @@ ENV PAPER_SEARCH_MCP_GOOGLE_SCHOLAR_PROXY_URL=""
 ENV PAPER_SEARCH_MCP_IEEE_API_KEY=""
 ENV PAPER_SEARCH_MCP_ACM_API_KEY=""
 
+# HTTP transport (override at runtime with -e). Defaults to stdio, the original
+# behavior, so `docker run -i paper-search-mcp` still works unchanged. Set
+# MCP_TRANSPORT=streamable-http (or sse) to expose the server over HTTP instead.
+ENV MCP_TRANSPORT="stdio"
+ENV MCP_HOST="0.0.0.0"
+ENV MCP_PORT="8000"
+ENV MCP_PATH="/mcp"
+# Optional bearer token. When set, every HTTP request must carry
+# `Authorization: Bearer <MCP_AUTH_TOKEN>`. Empty = open endpoint.
+ENV MCP_AUTH_TOKEN=""
+
+# Document the HTTP port. Only actually listened on when MCP_TRANSPORT is
+# streamable-http or sse; stdio mode does not bind any port.
+EXPOSE 8000
+
 # Use the entry point script
 CMD ["paper-search-mcp"]
