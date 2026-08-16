@@ -53,6 +53,7 @@ class _TransportSnapshotMixin(unittest.TestCase):
             "sse_path": server.mcp.settings.sse_path,
             "auth": server.mcp.settings.auth,
             "token_verifier": server.mcp._token_verifier,
+            "transport_security": server.mcp.settings.transport_security,
         }
         # Replace mcp.run with a recorder so main() never actually starts a server.
         self._orig_run = server.mcp.run
@@ -70,6 +71,7 @@ class _TransportSnapshotMixin(unittest.TestCase):
         server.mcp.settings.sse_path = self._orig["sse_path"]
         server.mcp.settings.auth = self._orig["auth"]
         server.mcp._token_verifier = self._orig["token_verifier"]
+        server.mcp.settings.transport_security = self._orig["transport_security"]
         server.mcp.run = self._orig_run
 
 
@@ -531,6 +533,7 @@ class TestHttpTransportLive(unittest.TestCase):
             "sse_path": server.mcp.settings.sse_path,
             "auth": server.mcp.settings.auth,
             "token_verifier": server.mcp._token_verifier,
+            "transport_security": server.mcp.settings.transport_security,
         }
         self._orig_state = orig
         # Force a fresh session manager on the next streamable_http_app() call.
@@ -548,6 +551,7 @@ class TestHttpTransportLive(unittest.TestCase):
         server.mcp.settings.sse_path = self._orig_state["sse_path"]
         server.mcp.settings.auth = self._orig_state["auth"]
         server.mcp._token_verifier = self._orig_state["token_verifier"]
+        server.mcp.settings.transport_security = self._orig_state["transport_security"]
         # Drop the cached session manager so a later live test can boot fresh.
         server.mcp._session_manager = None
 

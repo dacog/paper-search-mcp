@@ -1406,6 +1406,25 @@ def _apply_http_settings():
     mcp.settings.host = get_env("MCP_HOST", "0.0.0.0") or "0.0.0.0"
     mcp.settings.port = int(get_env("MCP_PORT", "8000") or "8000")
 
+    # Fix: FastMCP.__init__ auto-enables DNS rebinding protection when host is
+    # 127.0.0.1/localhost (the default). Since _apply_http_settings() runs after
+    # __init__ and may change the host to 0.0.0.0 or another bind address, we must
+    # update transport_security to match, otherwise remote clients get 421
+    # Misdirected Request because the Host header doesn't match 127.0.0.1.
+    from mcp.server.transport_security import TransportSecuritySettings
+
+    bind_host = mcp.settings.host
+    if bind_host in ("127.0.0.1", "localhost", "::1"):
+        mcp.settings.transport_security = TransportSecuritySettings(
+            enable_dns_rebinding_protection=True,
+            allowed_hosts=["127.0.0.1:*", "localhost:*", "[::1]:*"],
+            allowed_origins=["http://127.0.0.1:*", "http://localhost:*", "http://[::1]:*"],
+        )
+    else:
+        mcp.settings.transport_security = TransportSecuritySettings(
+            enable_dns_rebinding_protection=False,
+        )
+
     transport = get_env("MCP_TRANSPORT", "stdio") or "stdio"
     if transport == "streamable-http":
         mcp.settings.streamable_http_path = get_env("MCP_PATH", "/mcp") or "/mcp"
